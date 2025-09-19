@@ -1,14 +1,16 @@
 import io
 from datetime import datetime
+import re
+
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-# ==================== CONFIG ====================
-st.set_page_config(page_title="Saldos BB 2025 - Resumos Enxutos", layout="wide")
+# =============== CONFIG ===============
+st.set_page_config(page_title="Saldos BB 2025 - Secretaria e Relatório", layout="wide")
 pd.options.display.float_format = lambda x: f"R$ {x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
-# ==================== HELPERS ====================
+# =============== HELPERS ===============
 def brl(x) -> str:
     try:
         return f"R$ {float(x):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
@@ -18,7 +20,7 @@ def brl(x) -> str:
 def load_all_sheets(xlsx_bytes_or_path) -> pd.DataFrame:
     """
     Lê todas as abas (cada aba = um dia no formato dd-mm-aaaa) e retorna DF consolidado:
-    ['Conta','Nome da Conta','Secretaria','Banco','Saldo Bancario','Date']
+    ['Conta','Nome da Conta','Secretaria','Banco','Tipo de Recurso','Saldo Bancario','Date']
     """
     xls = pd.ExcelFile(xlsx_bytes_or_path)
     frames = []
@@ -26,7 +28,7 @@ def load_all_sheets(xlsx_bytes_or_path) -> pd.DataFrame:
         df = pd.read_excel(xls, sheet_name=sheet)
         df.columns = [c.strip() for c in df.columns]
 
-        expected = {"Conta", "Nome da Conta", "Secretaria", "Banco", "Saldo Bancario"}
+        expected = {"Conta", "Nome da Conta", "Secretaria", "Banco", "Tipo de Recurso", "Saldo Bancario"}
         missing = expected.difference(df.columns)
         if missing:
             raise ValueError(f"Aba '{sheet}' sem colunas esperadas: {missing}")
@@ -35,28 +37,35 @@ def load_all_sheets(xlsx_bytes_or_path) -> pd.DataFrame:
         d = pd.to_datetime(sheet, format="%d-%m-%Y", dayfirst=True, errors="coerce")
         df["Date"] = d
 
-        frames.append(df[["Conta","Nome da Conta","Secretaria","Banco","Saldo Bancario","Date"]])
+        frames.append(df[["Conta","Nome da Conta","Secretaria","Banco","Tipo de Recurso","Saldo Bancario","Date"]])
 
     out = pd.concat(frames, ignore_index=True)
+    # Tipagens e limpeza
     out["Saldo Bancario"] = pd.to_numeric(out["Saldo Bancario"], errors="coerce")
     out["Secretaria"] = out["Secretaria"].astype(str).str.strip()
     out["Conta"] = out["Conta"].astype(str).str.strip()
     out["Nome da Conta"] = out["Nome da Conta"].astype(str).str.strip()
-    return out.dropna(subset=["Saldo Bancario"])
+    out["Banco"] = out["Banco"].astype(str).str.strip()
+    out["Tipo de Recurso"] = out["Tipo de Recurso"].astype(str).str.strip()
+    out = out.dropna(subset=["Saldo Bancario"])
+    return out
 
-def to_excel_bytes(sheets: dict) -> bytes:
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
-        for name, df in sheets.items():
-            nm = name[:31]
-            df.to_excel(writer, index=False, sheet_name=nm)
-            ws = writer.sheets[nm]
-            for i, col in enumerate(df.columns):
-                width = min(max(12, df[col].astype(str).map(len).max() if not df.empty else 12) + 2, 50)
-                ws.set_column(i, i, width)
-    return buf.getvalue()
+def only_digits(text: str) -> str:
+    """Mantém apenas dígitos."""
+    return re.sub(r"\D+", "", text or "")
 
-# ==================== INPUT ====================
+def conta_prefix(conta: str) -> str:
+    """
+    Retorna a parte antes do hífen, somente dígitos.
+    Ex.: '12345-0' -> '12345'
+    """
+    if conta is None:
+        return ""
+    # pega tudo antes do primeiro '-'
+    head = str(conta).split("-")[0]
+    return only_digits(head)
+
+# =============== INPUT ===============
 st.sidebar.header("Arquivo")
 default_path = "/mnt/data/09 - Saldos BB 2025.xlsx"
 
@@ -77,7 +86,7 @@ else:
     st.info("Envie a planilha ou ative o arquivo padrão.")
     st.stop()
 
-# ==================== LOAD ====================
+# =============== LOAD ===============
 try:
     df = load_all_sheets(source)
 except Exception as e:
@@ -88,8 +97,8 @@ if df.empty:
     st.warning("Sem dados.")
     st.stop()
 
-# ==================== FILTROS ====================
-st.title("Saldos: Secretaria, Conta (nº) e Nome da Conta")
+# =============== FILTROS BÁSICOS ===============
+st.title("Saldos BB 2025 — Gráfico por Secretaria + Relatório")
 
 # Período
 if df["Date"].notna().any():
@@ -99,29 +108,33 @@ if df["Date"].notna().any():
 else:
     d_ini, d_fim = None, None
 
+# Filtro por Secretaria (multiselect)
 sec_opts = sorted(df["Secretaria"].dropna().unique().tolist())
-acc_opts = sorted(df["Conta"].dropna().unique().tolist())
-name_opts = sorted(df["Nome da Conta"].dropna().unique().tolist())
+sel_secs = st.sidebar.multiselect("Secretarias", sec_opts, default=sec_opts)
 
-sel_secs  = st.sidebar.multiselect("Secretarias", sec_opts, default=sec_opts)
-sel_accs  = st.sidebar.multiselect("Contas (nº)", acc_opts, default=acc_opts)
-sel_names = st.sidebar.multiselect("Contas (nome)", name_opts, default=name_opts)
+# Campo para filtrar por NÚMERO da conta digitando APENAS o prefixo (antes do hífen)
+st.sidebar.subheader("Filtro por Conta (prefixo antes do hífen)")
+prefix_input = st.sidebar.text_input("Digite apenas os números antes do hífen (ex.: 12345)", value="").strip()
+prefix_digits = only_digits(prefix_input)
 
+# Prepara coluna auxiliar com prefixo numérico
+df["_conta_prefix"] = df["Conta"].apply(conta_prefix)
+
+# Aplica filtros
 df_f = df.copy()
 if d_ini and d_fim:
     df_f = df_f[(df_f["Date"].dt.date >= d_ini) & (df_f["Date"].dt.date <= d_fim)]
 if sel_secs:
     df_f = df_f[df_f["Secretaria"].isin(sel_secs)]
-if sel_accs:
-    df_f = df_f[df_f["Conta"].isin(sel_accs)]
-if sel_names:
-    df_f = df_f[df_f["Nome da Conta"].isin(sel_names)]
+if prefix_digits:
+    # filtra onde o prefixo numérico da conta começa com o que foi digitado
+    df_f = df_f[df_f["_conta_prefix"].str.startswith(prefix_digits)]
 
 if df_f.empty:
     st.warning("Nenhum dado após aplicar os filtros.")
     st.stop()
 
-# ==================== MÉTRICA SUPERIOR ====================
+# =============== MÉTRICA SUPERIOR ===============
 colA, colB = st.columns([1,1])
 with colA:
     st.metric("Saldo Total (filtros)", brl(df_f["Saldo Bancario"].sum()))
@@ -129,63 +142,42 @@ with colB:
     if df_f["Date"].notna().any():
         st.caption(f"Período: {df_f['Date'].min().date().strftime('%d/%m/%Y')} → {df_f['Date'].max().date().strftime('%d/%m/%Y')}")
 
-# ==================== 1) SALDO POR SECRETARIA ====================
+# =============== GRÁFICO POR SECRETARIA ===============
 st.subheader("Saldo por Secretaria")
-by_sec = (df_f.groupby("Secretaria", as_index=False)["Saldo Bancario"].sum()
-          .rename(columns={"Saldo Bancario": "Saldo"})
-          .sort_values("Saldo", ascending=False))
 
-fig_sec = px.bar(by_sec, x="Secretaria", y="Saldo", text="Saldo")
-fig_sec.update_traces(texttemplate="%{text:.2f}", textposition="outside")
-fig_sec.update_layout(yaxis_title="Saldo (R$)", xaxis_title="Secretaria", bargap=0.3)
-st.plotly_chart(fig_sec, use_container_width=True)
+by_sec = (
+    df_f.groupby("Secretaria", as_index=False)["Saldo Bancario"]
+        .sum()
+        .rename(columns={"Saldo Bancario": "Saldo"})
+        .sort_values("Saldo", ascending=False)
+        .reset_index(drop=True)
+)
 
-st.dataframe(by_sec.assign(Saldo=by_sec["Saldo"].map(brl)), use_container_width=True)
+# Texto das barras em BRL; eixo y com prefixo R$
+fig = px.bar(by_sec, x="Secretaria", y="Saldo", text=by_sec["Saldo"].map(brl))
+fig.update_traces(textposition="outside")
+fig.update_layout(
+    yaxis_title="Saldo (R$)",
+    xaxis_title="Secretaria",
+    bargap=0.3,
+    yaxis_tickprefix="R$ ",
+    yaxis_tickformat=",.2f",
+    uniformtext_minsize=8,
+    uniformtext_mode="hide",
+)
+st.plotly_chart(fig, use_container_width=True)
 
-# ==================== 2) SALDO POR CONTA (NÚMERO) ====================
-st.subheader("Saldo por Conta (nº)")
-by_acc = (df_f.groupby("Conta", as_index=False)["Saldo Bancario"].sum()
-          .rename(columns={"Saldo Bancario": "Saldo"})
-          .sort_values("Saldo", ascending=False))
+# =============== RELATÓRIO "IGUAL À PLANILHA" ===============
+st.subheader("Relatório (igual à planilha)")
 
-fig_acc = px.bar(by_acc, x="Conta", y="Saldo", text="Saldo")
-fig_acc.update_traces(texttemplate="%{text:.2f}", textposition="outside")
-fig_acc.update_layout(yaxis_title="Saldo (R$)", xaxis_title="Conta (nº)", bargap=0.3)
-st.plotly_chart(fig_acc, use_container_width=True)
+df_rel = df_f.copy()
+df_rel["Data"] = df_rel["Date"].dt.strftime("%d/%m/%Y")
+df_rel["Saldo Bancario (R$)"] = df_rel["Saldo Bancario"].map(brl)
 
-st.dataframe(by_acc.assign(Saldo=by_acc["Saldo"].map(brl)), use_container_width=True)
+# Mantém ordem das colunas da planilha + Data no final
+cols_order = ["Conta","Nome da Conta","Secretaria","Banco","Tipo de Recurso","Saldo Bancario (R$)","Data"]
+st.dataframe(df_rel[cols_order].sort_values(["Data","Secretaria","Conta"]), use_container_width=True)
 
-# ==================== 3) SALDO POR NOME DA CONTA (TABELA) ====================
-st.subheader("Saldo por Nome da Conta")
-by_acc_name = (df_f.groupby("Nome da Conta", as_index=False)["Saldo Bancario"].sum()
-               .rename(columns={"Saldo Bancario": "Saldo"})
-               .sort_values("Saldo", ascending=False))
-
-st.dataframe(by_acc_name.assign(Saldo=by_acc_name["Saldo"].map(brl)), use_container_width=True)
-
-# ==================== EXPORTS ====================
-st.subheader("Exportar (resumos desta tela)")
-exp_dept = by_sec.copy();      exp_dept["Saldo"] = exp_dept["Saldo"].round(2)
-exp_acc  = by_acc.copy();      exp_acc["Saldo"]  = exp_acc["Saldo"].round(2)
-exp_name = by_acc_name.copy(); exp_name["Saldo"] = exp_name["Saldo"].round(2)
-
-c1, c2 = st.columns(2)
-with c1:
-    csv_bytes = pd.concat([
-        exp_dept.assign(__grupo__="Por Secretaria"),
-        exp_acc.assign(__grupo__="Por Conta (nº)"),
-        exp_name.assign(__grupo__="Por Conta (nome)")
-    ], ignore_index=True).to_csv(index=False).encode("utf-8-sig")
-    st.download_button("Baixar CSV (resumos)", data=csv_bytes, file_name="saldos_resumos.csv", mime="text/csv")
-
-with c2:
-    xlsx_bytes = to_excel_bytes({
-        "Por_Secretaria": exp_dept,
-        "Por_Conta_Num": exp_acc,
-        "Por_Conta_Nome": exp_name
-    })
-    st.download_button("Baixar Excel (abas)", data=xlsx_bytes,
-                       file_name="saldos_resumos.xlsx",
-                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-st.caption("Tela simplificada: apenas Secretaria, Conta (nº) e Nome da Conta.")
+# Observação do filtro
+if prefix_digits:
+    st.caption(f"Filtro de conta aplicado: prefixo **{prefix_digits}** (parte numérica antes do hífen).")
